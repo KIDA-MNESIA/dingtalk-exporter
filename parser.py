@@ -123,8 +123,30 @@ def get_database_status(db_path=None):
         return info
 
 
+def _validate_pagination(limit, offset):
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    if offset < 0:
+        raise ValueError("offset must be at least 0")
+
+
+def _page_result(key, items, total, limit, offset):
+    returned = len(items)
+    has_more = offset + returned < total
+    return {
+        "total": total,
+        key: items,
+        "limit": limit,
+        "offset": offset,
+        "returned": returned,
+        "has_more": has_more,
+        "next_offset": offset + returned if has_more else None,
+    }
+
+
 def get_conversations(conn, limit=100, offset=0, keyword=None):
     """Get conversation list with pagination and optional keyword filter."""
+    _validate_pagination(limit, offset)
     sql = """
         SELECT cid, type, title, memberCount, createAt, lastModify,
                unreadCount, top, ownerId, isNotification, extension
@@ -134,15 +156,30 @@ def get_conversations(conn, limit=100, offset=0, keyword=None):
     params = []
 
     if keyword:
-        sql += " AND title LIKE ?"
-        params.append(f"%{keyword}%")
+        # Single-chat titles are resolved from the other participant's profile.
+        # Apply that same lookup before counting and paginating the results.
+        sql += """
+            AND (title LIKE ? OR (
+                type = 1 AND INSTR(cid, ':') > 0 AND EXISTS (
+                    SELECT 1 FROM tbuser_profile_v2 AS profile
+                    WHERE profile.uid = CAST(
+                        CASE WHEN SUBSTR(tbconversation.cid, 1, INSTR(tbconversation.cid, ':') - 1) = ?
+                             THEN SUBSTR(tbconversation.cid, INSTR(tbconversation.cid, ':') + 1)
+                             ELSE SUBSTR(tbconversation.cid, 1, INSTR(tbconversation.cid, ':') - 1)
+                        END AS INTEGER
+                    ) AND (profile.nick LIKE ? OR profile.realName LIKE ?)
+                )
+            ))
+        """
+        pattern = f"%{keyword}%"
+        params.extend([pattern, str(config.USER_UID), pattern, pattern])
 
     # Count total
     count_sql = f"SELECT COUNT(*) FROM ({sql})"
     total = conn.execute(count_sql, params).fetchone()[0]
 
     # Order: top conversations first, then by lastModify
-    sql += " ORDER BY top DESC, lastModify DESC LIMIT ? OFFSET ?"
+    sql += " ORDER BY top DESC, lastModify DESC, cid ASC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
     rows = conn.execute(sql, params).fetchall()
@@ -171,12 +208,12 @@ def get_conversations(conn, limit=100, offset=0, keyword=None):
             user = get_user_profile(conn, int(other_uid))
             if user and user.get("nick"):
                 conv["title"] = user["nick"]
-            elif user and user.get("realName"):
-                conv["title"] = user["realName"]
+            elif user and user.get("real_name"):
+                conv["title"] = user["real_name"]
 
         conversations.append(conv)
 
-    return {"total": total, "conversations": conversations}
+    return _page_result("conversations", conversations, total, limit, offset)
 
 
 def get_user_profile(conn, uid):
@@ -234,17 +271,18 @@ def _get_all_msg_tables():
 
 def get_messages(conn, cid, limit=50, offset=0, since_time=None, until_time=None):
     """Get messages for a conversation with pagination and time filtering."""
+    _validate_pagination(limit, offset)
     table = _find_msg_table(conn, cid)
     if not table:
-        return {"total": 0, "messages": []}
+        return _page_result("messages", [], 0, limit, offset)
 
     where = "WHERE cid = ? AND recallStatus = 0"
     params = [cid]
 
-    if since_time:
+    if since_time is not None:
         where += " AND createdAt > ?"
         params.append(since_time)
-    if until_time:
+    if until_time is not None:
         where += " AND createdAt <= ?"
         params.append(until_time)
 
@@ -252,25 +290,24 @@ def get_messages(conn, cid, limit=50, offset=0, since_time=None, until_time=None
     count_sql = f'SELECT COUNT(*) FROM "{table}" {where}'
     total = conn.execute(count_sql, params).fetchone()[0]
 
-    # Fetch messages ordered by time ASC (oldest first, newest at bottom)
+    # Skip the newest `offset` rows, then take up to `limit` older rows.
+    # A stable tie-breaker keeps equal timestamps on consistent pages.
     sql = f'''
         SELECT primaryKey, cid, localId, mid, senderId, type, creatorType,
                createdAt, lastModify, contentType, content, recallStatus,
                atIds, attachments, extension, readStatus, sentlocaltime
         FROM "{table}" {where}
-        ORDER BY createdAt ASC
+        ORDER BY createdAt DESC, mid DESC, primaryKey DESC
         LIMIT ? OFFSET ?
     '''
-    # Reverse offset: show the LAST page by default (most recent messages)
-    # offset=0 means "first page from end" = skip (total - limit) oldest messages
-    actual_offset = max(0, total - limit - offset)
-    params.extend([limit, actual_offset])
+    params.extend([limit, offset])
 
     rows = conn.execute(sql, params).fetchall()
-    messages = [_parse_message(row, conn) for row in rows]
+    # Preserve the existing display order: oldest first within each page.
+    messages = [_parse_message(row, conn) for row in reversed(rows)]
     _mark_ding_messages(messages)
 
-    return {"total": total, "messages": messages}
+    return _page_result("messages", messages, total, limit, offset)
 
 
 def get_new_messages(conn, since_time, cid=None):
@@ -1020,26 +1057,41 @@ def _mark_ding_messages(messages):
 
 
 def search_messages(conn, keyword, limit=50, offset=0):
-    """Search messages by keyword across all message tables."""
-    results = []
-    for table in _get_all_msg_tables():
-        try:
-            rows = conn.execute(f'''
-                SELECT primaryKey, cid, localId, mid, senderId, type, creatorType,
-                       createdAt, lastModify, contentType, content, recallStatus,
-                       atIds, attachments, extension, readStatus, sentlocaltime
-                FROM "{table}"
-                WHERE content LIKE ? AND recallStatus = 0
-                ORDER BY createdAt DESC
-                LIMIT ? OFFSET ?
-            ''', (f"%{keyword}%", limit, offset)).fetchall()
+    """Return one globally ordered page, preserving the list-based Python API."""
+    return search_messages_page(conn, keyword, limit=limit, offset=offset)["messages"]
 
-            for row in rows:
-                results.append(_parse_message(row, conn))
-        except sqlite3.OperationalError:
-            continue
 
-    return results
+def search_messages_page(conn, keyword, limit=50, offset=0):
+    """Search all existing shards, with one global count, order and page."""
+    _validate_pagination(limit, offset)
+    existing = {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    tables = [table for table in _get_all_msg_tables() if table in existing]
+    if not tables:
+        return {"query": keyword, **_page_result("messages", [], 0, limit, offset)}
+
+    # Table names come from the fixed shard whitelist; keywords remain bound
+    # parameters. Paginating each shard independently can omit newer matches.
+    selects = [f'''
+        SELECT primaryKey, cid, localId, mid, senderId, type, creatorType,
+               createdAt, lastModify, contentType, content, recallStatus,
+               atIds, attachments, extension, readStatus, sentlocaltime,
+               '{table}' AS shard
+        FROM "{table}"
+        WHERE content LIKE ? AND recallStatus = 0
+    ''' for table in tables]
+    matched = "WITH matched AS (" + " UNION ALL ".join(selects) + ") "
+    params = [f"%{keyword}%"] * len(tables)
+    total = conn.execute(matched + "SELECT COUNT(*) FROM matched", params).fetchone()[0]
+    rows = conn.execute(
+        matched + """SELECT * FROM matched
+            ORDER BY createdAt DESC, cid DESC, mid DESC, primaryKey DESC, shard DESC
+            LIMIT ? OFFSET ?""",
+        [*params, limit, offset],
+    ).fetchall()
+    messages = [_parse_message(row, conn) for row in rows]
+    return {"query": keyword, **_page_result("messages", messages, total, limit, offset)}
 
 
 def get_conversation_stats(conn):

@@ -10,11 +10,13 @@ import logging
 import os
 import sys
 import threading
+from typing import Annotated
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import Field
 
 import config
 from log_utils import log_event
@@ -26,6 +28,9 @@ mcp = FastMCP(
     instructions=(
         "读取本机钉钉桌面客户端缓存的聊天记录。可列出会话、读取消息、全文搜索、"
         "查看统计、触发同步和导出。数据仅来自本机，未联网。"
+        "查询返回 total（匹配总数）、returned（本页条数）、has_more 和 next_offset。"
+        "继续读取时使用 next_offset，直到 has_more 为 false。"
+        "MCP 单独运行不会自动同步；需要更新缓存快照时调用 trigger_sync。"
     ),
 )
 
@@ -49,11 +54,6 @@ def _query(callback):
         conn.close()
 
 
-def _compress_messages(messages, limit=30):
-    """Keep messages compact for LLM consumption."""
-    return messages[:limit]
-
-
 @mcp.tool
 def get_database_status() -> dict:
     """检查解密数据库是否就绪（首次使用前需先同步）。"""
@@ -63,54 +63,59 @@ def get_database_status() -> dict:
 
 
 @mcp.tool
-def list_conversations(keyword: str | None = None, limit: int = 50) -> dict:
-    """列出会话。keyword 按名称模糊过滤，limit 最大 500。"""
+def list_conversations(
+    keyword: str | None = None,
+    limit: Annotated[int, Field(ge=1, le=500)] = 50,
+    offset: Annotated[int, Field(ge=0)] = 0,
+) -> dict:
+    """列出会话。keyword 匹配会话标题、单聊昵称或姓名；limit 为 1–500。
+    下一页使用返回的 next_offset；has_more=false 表示已读完。"""
     from parser import get_conversations
 
     return _query(
-        lambda conn: get_conversations(conn, limit=min(limit, 500), keyword=keyword)
+        lambda conn: get_conversations(conn, limit=limit, offset=offset, keyword=keyword)
     )
 
 
 @mcp.tool
 def get_messages(
     conversation_id: str,
-    limit: int = 30,
-    offset: int = 0,
+    limit: Annotated[int, Field(ge=1, le=500)] = 30,
+    offset: Annotated[int, Field(ge=0)] = 0,
     since_time: int | None = None,
     until_time: int | None = None,
 ) -> dict:
-    """读取指定会话的消息（默认返回最新一页）。limit 最大 500；
-    since_time/until_time 为毫秒时间戳，用于时间范围过滤；
-    offset 向上翻更早的页。"""
+    """读取指定会话的消息，默认取最新一页，页内按时间从早到晚排列。
+    limit 为 1–500；since_time < 消息时间 <= until_time，单位为毫秒。
+    offset 跳过最新的若干条，使用 next_offset 向更早的页翻阅。
+    has_more=false 表示已读完；遍历期间请勿同步，以保持分页稳定。"""
     from parser import get_messages as _get_messages
 
-    def _run(conn):
-        result = _get_messages(
+    return _query(
+        lambda conn: _get_messages(
             conn,
             conversation_id,
-            limit=min(limit, 500),
+            limit=limit,
             offset=offset,
             since_time=since_time,
             until_time=until_time,
         )
-        result["messages"] = _compress_messages(result["messages"], limit=min(limit, 100))
-        return result
-
-    return _query(_run)
+    )
 
 
 @mcp.tool
-def search_messages(keyword: str, limit: int = 30) -> dict:
-    """跨全部会话全文搜索消息。limit 最大 200。"""
-    from parser import search_messages as _search
+def search_messages(
+    keyword: str,
+    limit: Annotated[int, Field(ge=1, le=200)] = 30,
+    offset: Annotated[int, Field(ge=0)] = 0,
+) -> dict:
+    """跨全部会话搜索消息存储内容，按时间从新到旧排列。limit 为 1–200。
+    total 是全部匹配数；下一页使用 next_offset，has_more=false 表示已读完。"""
+    from parser import search_messages_page
 
-    def _run(conn):
-        results = _search(conn, keyword, limit=min(limit, 200))
-        results = _compress_messages(results, limit=min(limit, 100))
-        return {"query": keyword, "total": len(results), "messages": results}
-
-    return _query(_run)
+    return _query(
+        lambda conn: search_messages_page(conn, keyword, limit=limit, offset=offset)
+    )
 
 
 @mcp.tool

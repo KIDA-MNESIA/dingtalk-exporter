@@ -38,7 +38,7 @@ Windows 用户双击 `setup.bat`，Linux/Mac 用户运行 `./setup.sh`。
 
 ```bash
 # 克隆仓库
-git clone https://github.com/abbr530/dingtalk-exporter.git
+git clone https://github.com/KIDA-MNESIA/dingtalk-exporter.git
 cd dingtalk-exporter
 
 # 安装 Python 依赖
@@ -156,9 +156,9 @@ python mcp_server.py --http --host 127.0.0.1 --port 8091
 
 | 工具 | 说明 |
 |------|------|
-| `list_conversations` | 会话列表（按名称过滤、分页） |
-| `get_messages` | 读取指定会话消息（支持时间范围） |
-| `search_messages` | 跨全部会话全文搜索 |
+| `list_conversations` | 会话列表，支持标题、单聊昵称或姓名过滤；使用 `offset` 分页，`limit` 为 1–500 |
+| `get_messages` | 读取指定会话消息，支持时间范围和 `offset` 分页；`limit` 为 1–500 |
+| `search_messages` | 搜索全部消息分表的存储内容，按时间从新到旧返回；使用 `offset` 分页，`limit` 为 1–200 |
 | `get_stats` | 会话/消息统计 |
 | `get_database_status` | 解密数据库就绪状态 |
 | `get_sync_status` | 同步进度、上次导出路径 |
@@ -167,6 +167,41 @@ python mcp_server.py --http --host 127.0.0.1 --port 8091
 | `read_attachment` | 读取本地附件/导出文件内容给模型 |
 
 > **首次使用**：调用 `trigger_sync` 完成首次解密同步（可能耗时数分钟），再查询。导出类工具在后台执行，可通过 `get_sync_status` 查看完成状态。
+
+### 完整读取与分页
+
+这三个查询工具都返回以下字段：
+
+| 字段 | 含义 |
+|------|------|
+| `total` | 当前筛选条件下的全部匹配数，不是本页条数 |
+| `returned` | 本页实际返回的条数 |
+| `limit` / `offset` | 本次请求的分页参数 |
+| `has_more` | 是否还有下一页 |
+| `next_offset` | 下一页的 `offset`；读完后为 `null` |
+
+完整读取一个会话时，先调用 `get_messages(conversation_id=..., limit=500, offset=0)`。
+之后保持相同的会话、时间范围和 `limit`，将返回的 `next_offset` 用作下一次的 `offset`，直到 `has_more=false`。
+末页只返回剩余消息；`offset >= total` 时返回空列表。会话列表和跨会话搜索使用同一分页方法。
+
+`get_messages` 从最新一页向更早的页读取，每页内部按时间从早到晚排列。
+`search_messages` 则对全部分表统一排序、统一分页，每页按时间从新到旧排列。
+时间相同的消息使用固定的附加排序字段。`get_messages` 的时间条件为 `since_time < 消息时间 <= until_time`，单位为毫秒。
+工具不会在查询后再次截断消息；超出允许范围的 `limit` 或负数 `offset` 会返回参数错误。
+
+MCP 单独运行时不会启动自动同步任务。需要新数据时，调用 `trigger_sync`，并等待 `get_sync_status` 显示同步结束且没有错误，再开始读取。
+连续翻页期间不要再次同步，否则快照中的消息数量和位置可能变化。数据仍仅来自本机缓存，未缓存的云端历史不会由此补齐。
+`read_attachment` 只读取文本附件，不提取 PDF、Word、图片或语音的内容。
+
+### 回归测试
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+测试使用合成 SQLite 数据，不读取本机聊天记录，也不启动同步任务。
+覆盖分页边界、单聊名称查询、跨分片搜索、导出末页、Web API 和真实 stdio MCP 调用。
 
 ## 项目结构
 

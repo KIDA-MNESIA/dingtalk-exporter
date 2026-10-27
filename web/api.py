@@ -16,7 +16,7 @@ from parser import (
     get_connection,
     get_conversations,
     get_messages,
-    search_messages,
+    search_messages_page,
     get_conversation_stats,
     get_database_status,
 )
@@ -138,11 +138,9 @@ async def api_search(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    def _search(conn):
-        results = search_messages(conn, q, limit=limit, offset=offset)
-        return {"query": q, "total": len(results), "messages": results}
-
-    return _query_db(_search)
+    return _query_db(
+        lambda conn: search_messages_page(conn, q, limit=limit, offset=offset)
+    )
 
 
 @app.get("/api/stats")
