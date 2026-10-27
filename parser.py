@@ -79,20 +79,18 @@ def _validate_database_schema(conn):
         )
 
 
-def get_connection(db_path=None):
+def get_connection(db_path=None, snapshot_id=None):
     """Get a SQLite connection to the decrypted database."""
-    if db_path is None:
-        db_path = config.DECRYPTED_DB_PATH
-    if not os.path.isfile(db_path):
-        raise DatabaseNotReadyError(
-            "未找到解密后的聊天数据库，请先点击“手动同步”完成首次解密。"
-        )
+    from snapshots import SnapshotError, open_snapshot
+
     conn = None
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = open_snapshot(db_path=db_path, snapshot_id=snapshot_id)
         _validate_database_schema(conn)
+    except SnapshotError as exc:
+        if conn is not None:
+            conn.close()
+        raise DatabaseNotReadyError(f"{getattr(exc, 'code', 'snapshot_error')}: {exc}") from exc
     except sqlite3.Error as exc:
         if conn is not None:
             conn.close()
@@ -105,18 +103,20 @@ def get_connection(db_path=None):
     return conn
 
 
-def get_database_status(db_path=None):
+def get_database_status(db_path=None, snapshot_id=None):
     """Return whether the decrypted database is ready for queries."""
-    if db_path is None:
-        db_path = config.DECRYPTED_DB_PATH
-    info = _get_db_file_info(db_path)
+    from snapshots import connection_metadata
+
+    info = {"path": db_path or config.DECRYPTED_DB_PATH, "exists": False}
     try:
-        conn = get_connection(db_path)
+        conn = get_connection(db_path, snapshot_id=snapshot_id)
     except DatabaseNotReadyError as exc:
         info["ready"] = False
         info["error"] = str(exc)
         return info
     else:
+        info = _get_db_file_info(conn.execute("PRAGMA database_list").fetchone()[2])
+        info.update(connection_metadata(conn))
         conn.close()
         info["ready"] = True
         info["error"] = None
@@ -130,10 +130,10 @@ def _validate_pagination(limit, offset):
         raise ValueError("offset must be at least 0")
 
 
-def _page_result(key, items, total, limit, offset):
+def _page_result(key, items, total, limit, offset, conn=None):
     returned = len(items)
     has_more = offset + returned < total
-    return {
+    result = {
         "total": total,
         key: items,
         "limit": limit,
@@ -142,6 +142,10 @@ def _page_result(key, items, total, limit, offset):
         "has_more": has_more,
         "next_offset": offset + returned if has_more else None,
     }
+    if conn is not None:
+        from snapshots import connection_metadata
+        result.update(connection_metadata(conn))
+    return result
 
 
 def get_conversations(conn, limit=100, offset=0, keyword=None):
@@ -213,7 +217,7 @@ def get_conversations(conn, limit=100, offset=0, keyword=None):
 
         conversations.append(conv)
 
-    return _page_result("conversations", conversations, total, limit, offset)
+    return _page_result("conversations", conversations, total, limit, offset, conn)
 
 
 def get_user_profile(conn, uid):
@@ -269,12 +273,12 @@ def _get_all_msg_tables():
     return [f"tbmsg_{i:03d}" for i in range(128)]
 
 
-def get_messages(conn, cid, limit=50, offset=0, since_time=None, until_time=None):
+def get_messages(conn, cid, limit=50, offset=0, since_time=None, until_time=None, include_forwarded=False):
     """Get messages for a conversation with pagination and time filtering."""
     _validate_pagination(limit, offset)
     table = _find_msg_table(conn, cid)
     if not table:
-        return _page_result("messages", [], 0, limit, offset)
+        return _page_result("messages", [], 0, limit, offset, conn)
 
     where = "WHERE cid = ? AND recallStatus = 0"
     params = [cid]
@@ -306,8 +310,33 @@ def get_messages(conn, cid, limit=50, offset=0, since_time=None, until_time=None
     # Preserve the existing display order: oldest first within each page.
     messages = [_parse_message(row, conn) for row in reversed(rows)]
     _mark_ding_messages(messages)
+    if not include_forwarded:
+        for message in messages:
+            message.pop("forwarded_messages", None)
 
-    return _page_result("messages", messages, total, limit, offset)
+    return _page_result("messages", messages, total, limit, offset, conn)
+
+
+def get_forwarded_messages(conn, cid, message_id, limit=100, offset=0):
+    """Read the cached children of a merged-forward message in attachment order."""
+    _validate_pagination(limit, offset)
+    table = _find_msg_table(conn, cid)
+    row = conn.execute(
+        f'SELECT * FROM "{table}" WHERE cid=? AND mid=? AND recallStatus=0',
+        (cid, message_id),
+    ).fetchone() if table else None
+    if row is None:
+        raise ValueError("未找到指定的未撤回消息")
+    if row["contentType"] != 1500:
+        raise ValueError("指定消息不是合并转发")
+    root = _parse_message(row, conn)
+    children = root.get("forwarded_messages", [])
+    return {
+        **_page_result("messages", children[offset:offset + limit], len(children), limit, offset, conn),
+        "conversation_id": cid,
+        "message_id": root["id"],
+        **root["forwarded_info"],
+    }
 
 
 def get_new_messages(conn, since_time, cid=None):
@@ -375,7 +404,7 @@ def _merge_inline_images(messages):
             msg["inline_images"] = inline_imgs
 
 
-def _parse_message(row, conn):
+def _parse_message(row, conn, expand_forwarded=True):
     """Parse a message row into a structured dict."""
     content_type = row["contentType"]
     content_raw = row["content"] or ""
@@ -384,13 +413,22 @@ def _parse_message(row, conn):
 
     # Parse content JSON
     content_data = _parse_json_dict(content_raw)
-    if not content_data and content_raw:
-        content_data = {"text": content_raw}
+    if not content_data and content_raw and isinstance(content_raw, str) and content_type == MSG_TYPE_TEXT:
+        try:
+            decoded = json.loads(content_raw)
+        except (TypeError, ValueError):
+            decoded = content_raw
+        if isinstance(decoded, str):
+            content_data = {"text": decoded}
 
     # Extract text content based on content type
     text = ""
     message_subtype = ""
     quote_info = None
+    forwarded_info = None
+    forwarded_messages = None
+    video_info = None
+    contact_info = None
     if content_type == MSG_TYPE_TEXT:
         text = content_data.get("text", "")
         if row_extension_data.get("BIType") == "confirm_ding_system_msg":
@@ -423,8 +461,35 @@ def _parse_message(row, conn):
             message_subtype = "announcement"
         elif row_extension_data.get("BIType") == "confirm_ding_system_msg" or "DING" in text:
             message_subtype = "ding_status"
-    elif content_type == MSG_TYPE_FILE:
+    elif content_type in (500, MSG_TYPE_FILE, 503):
         text = "[文件]"
+    elif content_type == 202:
+        text = "[视频]"
+        ext = _attachment_extensions(attachments_raw, content_data)
+        video_info = {
+            key: ext[key] for key in ("fileType", "duration", "width", "height")
+            if key in ext and isinstance(ext[key], (str, int, float))
+        }
+    elif content_type == 600:
+        ext = _attachment_extensions(attachments_raw, content_data)
+        contact_info = {
+            key: ext[key] for key in ("name", "uid", "phone")
+            if key in ext and isinstance(ext[key], (str, int))
+        }
+        text = "[联系人名片]" + (" " + str(contact_info["name"]) if contact_info.get("name") else "")
+    elif content_type == 1500:
+        text = "[合并转发]"
+        if expand_forwarded:
+            from forwarded import decode_forwarded
+            decoded = decode_forwarded(
+                attachments_raw, content_data,
+                lambda child: _parse_message(child, conn, expand_forwarded=False),
+            )
+            forwarded_messages = decoded["messages"]
+            forwarded_info = {key: value for key, value in decoded.items() if key != "messages"}
+            forwarded_info["total"] = len(forwarded_messages)
+            forwarded_info["tool"] = "get_forwarded_messages"
+            text = "\n".join(piece for piece in (decoded.get("title"), decoded.get("summary")) if piece) or text
     elif content_type in (MSG_TYPE_RICH_TEXT, 1201, 1202):
         quote_info = _extract_reply_info(content_data, row_extension_data, conn)
         if quote_info:
@@ -455,6 +520,8 @@ def _parse_message(row, conn):
     # Clean surrogate characters that can break JSON serialization
     if isinstance(text, str):
         text = _clean_surrogates(text)
+    else:
+        text = ""
 
     # Get sender info
     sender_id = row["senderId"]
@@ -489,7 +556,18 @@ def _parse_message(row, conn):
         "at_ids": at_ids,
         "attachments": attachment_list,
         "is_ding": False,
+        "parse_status": "complete" if text else "unsupported",
     }
+    if not text:
+        msg["text"] = f"[{msg['content_type_name']}：正文尚未解析]"
+    if forwarded_info is not None:
+        msg["forwarded_info"] = forwarded_info
+        msg["forwarded_messages"] = forwarded_messages
+        msg["parse_status"] = forwarded_info["parse_status"]
+    if video_info is not None:
+        msg["video_info"] = video_info
+    if contact_info is not None:
+        msg["contact_info"] = contact_info
 
     if quote_info:
         msg["quote_info"] = quote_info
@@ -509,7 +587,26 @@ def _parse_message(row, conn):
         if audio_info:
             msg["audio_info"] = audio_info
 
+    from message_content import build_agent_content
+    msg["content"] = build_agent_content(msg)
     return msg
+
+
+def _attachment_extensions(attachments_raw, content_data):
+    """Use named fields from observed attachment payloads; ignore opaque values."""
+    try:
+        attachments = json.loads(attachments_raw) if isinstance(attachments_raw, str) else attachments_raw
+    except (TypeError, ValueError):
+        attachments = None
+    if not isinstance(attachments, list) or not attachments:
+        attachments = content_data.get("attachments", [])
+    if not isinstance(attachments, list):
+        return {}
+    result = {}
+    for attachment in attachments:
+        attachment = _parse_json_dict(attachment)
+        result.update(_parse_json_dict(attachment.get("extension")))
+    return result
 
 
 def _parse_attachments(attachments_raw, content_data, content_type, mid):
@@ -1056,20 +1153,25 @@ def _mark_ding_messages(messages):
             candidates[-1]["is_ding"] = True
 
 
-def search_messages(conn, keyword, limit=50, offset=0):
+def search_messages(conn, keyword, limit=50, offset=0, mode="text"):
     """Return one globally ordered page, preserving the list-based Python API."""
-    return search_messages_page(conn, keyword, limit=limit, offset=offset)["messages"]
+    return search_messages_page(conn, keyword, limit=limit, offset=offset, mode=mode)["messages"]
 
 
-def search_messages_page(conn, keyword, limit=50, offset=0):
+def search_messages_page(conn, keyword, limit=50, offset=0, mode="text"):
     """Search all existing shards, with one global count, order and page."""
     _validate_pagination(limit, offset)
+    if mode == "text":
+        from search_index import search_indexed_messages
+        return search_indexed_messages(conn, keyword, limit=limit, offset=offset)
+    if mode != "raw":
+        raise ValueError("mode 必须是 text 或 raw")
     existing = {
         row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     tables = [table for table in _get_all_msg_tables() if table in existing]
     if not tables:
-        return {"query": keyword, **_page_result("messages", [], 0, limit, offset)}
+        return {"query": keyword, "mode": mode, **_page_result("messages", [], 0, limit, offset, conn)}
 
     # Table names come from the fixed shard whitelist; keywords remain bound
     # parameters. Paginating each shard independently can omit newer matches.
@@ -1091,7 +1193,9 @@ def search_messages_page(conn, keyword, limit=50, offset=0):
         [*params, limit, offset],
     ).fetchall()
     messages = [_parse_message(row, conn) for row in rows]
-    return {"query": keyword, **_page_result("messages", messages, total, limit, offset)}
+    for message in messages:
+        message.pop("forwarded_messages", None)
+    return {"query": keyword, "mode": mode, **_page_result("messages", messages, total, limit, offset, conn)}
 
 
 def get_conversation_stats(conn):

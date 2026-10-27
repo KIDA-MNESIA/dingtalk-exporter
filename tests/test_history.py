@@ -122,6 +122,7 @@ class HistoryTests(unittest.TestCase):
             messages = data["conversations"][0]["messages"]
             self.assertEqual(len(messages), 554)
             self.assertEqual(len({m["message_id"] for m in messages}), 554)
+            self.assertEqual([m["message_id"] for m in messages], list(range(1, 555)))
 
     def test_web_search_reports_global_total(self):
         from fastapi.testclient import TestClient
@@ -131,7 +132,7 @@ class HistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "fixture.db")
             create_database(path).close()
-            with patch.object(config, "DECRYPTED_DB_PATH", path):
+            with patch.object(config, "DECRYPTED_DB_PATH", path), patch.object(config, "DECRYPTED_DIR", directory):
                 # Do not enter TestClient's lifespan: that would start the sync scheduler.
                 client = TestClient(app)
                 self.addCleanup(client.close)

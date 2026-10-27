@@ -4,6 +4,7 @@ import subprocess
 import shutil
 import stat
 import sys
+from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
@@ -16,11 +17,12 @@ from parser import (
     get_connection,
     get_conversations,
     get_messages,
+    get_forwarded_messages,
     search_messages_page,
     get_conversation_stats,
     get_database_status,
 )
-from scheduler import get_sync_state, do_sync, setup_scheduler
+from scheduler import get_sync_state, start_sync, start_refresh, start_export, setup_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +53,21 @@ def _remove_readonly(func, path, exc_info):
         raise exc
 
 
-def _query_db(callback):
+def _query_db(callback, snapshot_id=None):
     """Run a callback with a validated database connection."""
     try:
-        conn = get_connection()
+        conn = get_connection(snapshot_id=snapshot_id)
     except DatabaseNotReadyError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        return callback(conn)
+        from snapshots import connection_metadata
+        result = callback(conn)
+        if isinstance(result, dict):
+            result.update(connection_metadata(conn))
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -100,6 +108,14 @@ if os.path.isdir(STATIC_DIR):
 
 # --- API Routes ---
 
+
+def _job_response(result):
+    if result["status"] == "already_running":
+        raise HTTPException(status_code=409, detail="已有刷新或导出任务正在运行，请等待完成后重试。")
+    if result["status"] == "failed":
+        raise HTTPException(status_code=503, detail=result.get("error") or "无法启动后台任务")
+    return result
+
 @app.get("/api/config")
 async def api_config():
     """Return public configuration for the frontend."""
@@ -111,9 +127,11 @@ async def api_conversations(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     keyword: str = Query(None),
+    snapshot_id: str = Query(None),
 ):
     return _query_db(
-        lambda conn: get_conversations(conn, limit=limit, offset=offset, keyword=keyword)
+        lambda conn: get_conversations(conn, limit=limit, offset=offset, keyword=keyword),
+        snapshot_id=snapshot_id,
     )
 
 
@@ -124,11 +142,26 @@ async def api_messages(
     offset: int = Query(0, ge=0),
     since: int = Query(None, description="Since timestamp (ms)"),
     until: int = Query(None, description="Until timestamp (ms)"),
+    snapshot_id: str = Query(None),
 ):
     return _query_db(
         lambda conn: get_messages(
             conn, cid, limit=limit, offset=offset, since_time=since, until_time=until
-        )
+        ),
+        snapshot_id=snapshot_id,
+    )
+
+
+@app.get("/api/conversations/{cid}/messages/{mid}/forwarded")
+async def api_forwarded_messages(
+    cid: str, mid: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    snapshot_id: str = Query(None),
+):
+    return _query_db(
+        lambda conn: get_forwarded_messages(conn, cid, mid, limit=limit, offset=offset),
+        snapshot_id=snapshot_id,
     )
 
 
@@ -137,15 +170,18 @@ async def api_search(
     q: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    mode: Literal["text", "raw"] = "text",
+    snapshot_id: str = Query(None),
 ):
     return _query_db(
-        lambda conn: search_messages_page(conn, q, limit=limit, offset=offset)
+        lambda conn: search_messages_page(conn, q, limit=limit, offset=offset, mode=mode),
+        snapshot_id=snapshot_id,
     )
 
 
 @app.get("/api/stats")
-async def api_stats():
-    return _query_db(get_conversation_stats)
+async def api_stats(snapshot_id: str = Query(None)):
+    return _query_db(get_conversation_stats, snapshot_id=snapshot_id)
 
 
 @app.get("/api/sync/status")
@@ -161,16 +197,22 @@ async def api_sync_status():
 
 @app.post("/api/sync/trigger")
 async def api_sync_trigger(full: bool = Query(False)):
-    state = get_sync_state()
-    if state.get("is_syncing"):
-        raise HTTPException(status_code=409, detail="Sync already in progress")
+    result = start_sync(full=full)
+    return {**_job_response(result), "full": full}
 
-    # Run sync in background thread to avoid blocking
-    import threading
-    thread = threading.Thread(target=do_sync, kwargs={"full": full}, daemon=True)
-    thread.start()
 
-    return {"status": "started", "full": full}
+@app.post("/api/database/refresh")
+async def api_refresh_database():
+    return _job_response(start_refresh())
+
+
+@app.get("/api/jobs/{job_id}")
+async def api_job_status(job_id: str):
+    from jobs import get_job_status, JobNotFoundError
+    try:
+        return get_job_status(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/export/selected")
@@ -182,30 +224,8 @@ async def api_export_selected(body: dict):
     if not cids:
         raise HTTPException(status_code=400, detail="No conversations selected")
 
-    import threading
-
-    thread = threading.Thread(
-        target=_do_export_selected, args=(cids, since_time, until_time), daemon=True
-    )
-    thread.start()
-    return {"status": "started", "selected_count": len(cids)}
-
-
-def _do_export_selected(cids, since_time=None, until_time=None):
-    """Run the selected export in a background thread."""
-    import scheduler as sched
-    sched._sync_state["is_syncing"] = True
-    sched._sync_state["last_error"] = None
-    try:
-        from exporter import export_by_cids
-        path = export_by_cids(cids, since_time=since_time, until_time=until_time)
-        sched._sync_state["last_export_path"] = path
-        sched._sync_state["sync_count"] += 1
-    except Exception as e:
-        logger.error(f"Selected export failed: {e}", exc_info=True)
-        sched._sync_state["last_error"] = str(e)
-    finally:
-        sched._sync_state["is_syncing"] = False
+    result = start_export(cids, since_time=since_time, until_time=until_time, snapshot_id=body.get("snapshot_id"))
+    return {**_job_response(result), "selected_count": len(cids)}
 
 
 @app.get("/api/attachments/{path:path}")

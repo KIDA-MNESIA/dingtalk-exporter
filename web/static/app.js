@@ -561,36 +561,45 @@ async function loadSyncStatus() {
     }
 }
 
+async function waitForJob(started, interval = 2000) {
+    if (!started || started.status !== 'started' || !started.job_id) {
+        throw new Error(started?.error || '任务未启动，请等待当前任务完成后重试');
+    }
+    while (true) {
+        const job = await apiGet(`/api/jobs/${encodeURIComponent(started.job_id)}`);
+        if (job.status === 'failed') {
+            throw new Error(job.error || '任务失败');
+        }
+        if (job.status === 'succeeded') {
+            const result = job.result || {};
+            if (result.outcome === 'fallback' || result.outcome === 'failed') {
+                throw new Error(result.error || '刷新失败，仍使用原有快照');
+            }
+            return result;
+        }
+        if (job.status !== 'running') {
+            throw new Error('无法识别任务状态');
+        }
+        await new Promise(resolve => setTimeout(resolve, interval));
+    }
+}
+
 async function triggerSync() {
     const btn = document.getElementById('syncBtn');
     btn.disabled = true;
     btn.textContent = '同步中...';
 
     try {
-        await apiPost('/api/sync/trigger');
+        const started = await apiPost('/api/sync/trigger');
         document.getElementById('syncStatus').textContent = '同步已触发...';
-
-        // Poll for completion
-        const poll = setInterval(async () => {
-            try {
-                const s = await apiGet('/api/sync/status');
-                if (!s.is_syncing) {
-                    clearInterval(poll);
-                    btn.disabled = false;
-                    btn.textContent = '手动同步';
-                    loadSyncStatus();
-                    // Reload conversations if we have one selected
-                    if (state.currentCid) {
-                        loadMessages();
-                    }
-                }
-            } catch (e) {
-            }
-        }, 3000);
+        await waitForJob(started);
+        loadSyncStatus();
+        if (state.currentCid) loadMessages();
     } catch (e) {
+        alert('同步失败: ' + e.message);
+    } finally {
         btn.disabled = false;
         btn.textContent = '手动同步';
-        alert('同步失败: ' + e.message);
     }
 }
 
@@ -944,26 +953,18 @@ function init() {
         timeRangePreviewEl.textContent = `${formatDate(since)} ~ ${formatDate(now)}`;
     }
 
-    async function pollExportCompletion(btn) {
-        const poll = setInterval(async () => {
-            try {
-                const s = await apiGet('/api/sync/status');
-                if (!s.is_syncing) {
-                    clearInterval(poll);
-                    btn.disabled = false;
-                    btn.textContent = '导出选中会话';
-                    if (s.last_error) {
-                        alert('导出失败: ' + s.last_error);
-                        return;
-                    }
-                    document.querySelectorAll('.export-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'files'));
-                    document.getElementById('exportPanelSelect').style.display = 'none';
-                    document.getElementById('exportPanelFiles').style.display = '';
-                    loadExports();
-                }
-            } catch (e) {
-            }
-        }, 2000);
+    async function pollExportCompletion(btn, started) {
+        try {
+            const result = await waitForJob(started);
+            if (!result.export_path) throw new Error('任务结束，但没有生成导出文件');
+            document.querySelectorAll('.export-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === 'files'));
+            document.getElementById('exportPanelSelect').style.display = 'none';
+            document.getElementById('exportPanelFiles').style.display = '';
+            loadExports();
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '导出选中会话';
+        }
     }
 
     exportTimeRangeEl.addEventListener('change', toggleCustomTimeRange);
@@ -1026,7 +1027,7 @@ function init() {
                 throw new Error(data.detail || `HTTP ${resp.status}`);
             }
 
-            pollExportCompletion(btn);
+            await pollExportCompletion(btn, await resp.json());
         } catch (e) {
             btn.disabled = false;
             btn.textContent = '导出选中会话';
@@ -1042,27 +1043,17 @@ function init() {
         progress.textContent = '正在触发全量导出...';
 
         try {
-            await apiPost('/api/sync/trigger?full=true');
-            const poll = setInterval(async () => {
-                try {
-                    const s = await apiGet('/api/sync/status');
-                    if (!s.is_syncing) {
-                        clearInterval(poll);
-                        btn.disabled = false;
-                        progress.textContent = s.last_export_path ? '导出完成' : '同步完成';
-                        loadExports();
-                        setTimeout(() => {
-                            progress.textContent = '';
-                        }, 5000);
-                    } else {
-                        progress.textContent = '导出中，请稍候...';
-                    }
-                } catch (e) {
-                }
-            }, 3000);
+            const started = await apiPost('/api/sync/trigger?full=true');
+            progress.textContent = '导出中，请稍候...';
+            const result = await waitForJob(started);
+            if (!result.export_path) throw new Error('任务结束，但没有生成导出文件');
+            progress.textContent = '导出完成';
+            loadExports();
+            setTimeout(() => { progress.textContent = ''; }, 5000);
         } catch (e) {
-            btn.disabled = false;
             progress.textContent = '导出失败: ' + e.message;
+        } finally {
+            btn.disabled = false;
         }
     });
 
